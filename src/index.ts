@@ -67,6 +67,7 @@ class GodotServer {
   private activeProcess: GodotProcess | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
+  private screenshotScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
   private strictPathValidation: boolean = false;
 
@@ -90,6 +91,8 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'delay_frames': 'delayFrames',
+    'screenshot_path': 'screenshotPath',
   };
 
   /**
@@ -134,7 +137,9 @@ class GodotServer {
 
     // Set the path to the operations script
     this.operationsScriptPath = join(__dirname, 'scripts', 'godot_operations.gd');
+    this.screenshotScriptPath = join(__dirname, 'scripts', 'screenshot_helper.gd');
     if (debugMode) console.debug(`[DEBUG] Operations script path: ${this.operationsScriptPath}`);
+    if (debugMode) console.debug(`[DEBUG] Screenshot script path: ${this.screenshotScriptPath}`);
 
     // Initialize the MCP server
     this.server = new Server(
@@ -212,6 +217,34 @@ class GodotServer {
 
     // Add more validation as needed
     return true;
+  }
+
+  /**
+   * Generate a timestamped screenshot filename
+   * @returns Filename like "screenshot_2025-01-15_143022.png"
+   */
+  private generateScreenshotFilename(): string {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    const seconds = String(now.getSeconds()).padStart(2, '0');
+    return `screenshot_${year}-${month}-${day}_${hours}${minutes}${seconds}.png`;
+  }
+
+  /**
+   * Ensure the .godot-mcp directory exists in the project
+   * @param projectPath Path to the Godot project
+   * @returns The absolute path to the .godot-mcp directory
+   */
+  private ensureScreenshotDir(projectPath: string): string {
+    const screenshotDir = join(projectPath, '.godot-mcp');
+    if (!existsSync(screenshotDir)) {
+      mkdirSync(screenshotDir, { recursive: true });
+    }
+    return screenshotDir;
   }
 
   /**
@@ -924,6 +957,60 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'screenshot_scene',
+          description: 'Run a specific scene, capture a screenshot, and quit. Saves to .godot-mcp/ folder with timestamp.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (.tscn) to screenshot (relative to project)',
+              },
+              delayFrames: {
+                type: 'number',
+                description: 'Number of frames to wait before capturing (default: 2)',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'screenshot_project',
+          description: 'Run the main project scene, capture a screenshot, and quit. Saves to .godot-mcp/ folder with timestamp.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              delayFrames: {
+                type: 'number',
+                description: 'Number of frames to wait before capturing (default: 2)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'screenshot_editor',
+          description: 'Capture a screenshot of the Godot editor window (if open). Saves to .godot-mcp/ folder with timestamp.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory (for saving the screenshot)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
       ],
     }));
 
@@ -959,6 +1046,12 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'screenshot_scene':
+          return await this.handleScreenshotScene(request.params.arguments);
+        case 'screenshot_project':
+          return await this.handleScreenshotProject(request.params.arguments);
+        case 'screenshot_editor':
+          return await this.handleScreenshotEditor(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2149,6 +2242,274 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the screenshot_scene tool
+   * Runs a specific scene, captures a screenshot, and quits
+   */
+  private async handleScreenshotScene(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.scenePath) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide valid paths for both the project and the scene']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      // Validate project
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          ['Ensure the path contains a project.godot file']
+        );
+      }
+
+      // Validate scene exists
+      const scenePath = join(args.projectPath, args.scenePath);
+      if (!existsSync(scenePath)) {
+        return this.createErrorResponse(
+          `Scene file does not exist: ${args.scenePath}`,
+          ['Ensure the scene path is correct and the file exists']
+        );
+      }
+
+      // Ensure screenshot directory exists
+      const screenshotDir = this.ensureScreenshotDir(args.projectPath);
+      const filename = this.generateScreenshotFilename();
+      const outputPath = join(screenshotDir, filename);
+
+      // Ensure Godot path is set
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            ['Set GODOT_PATH environment variable']
+          );
+        }
+      }
+
+      const delayFrames = args.delayFrames || 2;
+
+      // Build command - run scene with screenshot script
+      const cmdArgs = [
+        `"${this.godotPath}"`,
+        '--path', `"${args.projectPath}"`,
+        `"${args.scenePath}"`,
+        '--script', `"${this.screenshotScriptPath}"`,
+        '--screenshot-output', `"${outputPath}"`,
+        '--delay-frames', String(delayFrames),
+      ];
+
+      this.logDebug(`Running scene for screenshot: ${args.scenePath}`);
+      this.logDebug(`Command: ${cmdArgs.join(' ')}`);
+
+      const { stdout, stderr } = await execAsync(cmdArgs.join(' '), { timeout: 30000 });
+
+      this.logDebug(`Screenshot stdout: ${stdout}`);
+      if (stderr) this.logDebug(`Screenshot stderr: ${stderr}`);
+
+      // Check if screenshot was created
+      if (existsSync(outputPath)) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Screenshot captured successfully!\nPath: ${outputPath}\nScene: ${args.scenePath}`,
+            },
+          ],
+        };
+      } else {
+        return this.createErrorResponse(
+          'Screenshot capture failed - file was not created',
+          ['Check Godot output for errors', 'Try increasing delayFrames', `stdout: ${stdout}`, `stderr: ${stderr}`]
+        );
+      }
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed correctly', 'Check if the scene can be run']
+      );
+    }
+  }
+
+  /**
+   * Handle the screenshot_project tool
+   * Runs the main project scene, captures a screenshot, and quits
+   */
+  private async handleScreenshotProject(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          ['Ensure the path contains a project.godot file']
+        );
+      }
+
+      const screenshotDir = this.ensureScreenshotDir(args.projectPath);
+      const filename = this.generateScreenshotFilename();
+      const outputPath = join(screenshotDir, filename);
+
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            ['Set GODOT_PATH environment variable']
+          );
+        }
+      }
+
+      const delayFrames = args.delayFrames || 2;
+
+      // Run the main project scene (no scene path = use project's main scene)
+      const cmdArgs = [
+        `"${this.godotPath}"`,
+        '--path', `"${args.projectPath}"`,
+        '--script', `"${this.screenshotScriptPath}"`,
+        '--screenshot-output', `"${outputPath}"`,
+        '--delay-frames', String(delayFrames),
+      ];
+
+      this.logDebug(`Running project for screenshot: ${args.projectPath}`);
+      this.logDebug(`Command: ${cmdArgs.join(' ')}`);
+
+      const { stdout, stderr } = await execAsync(cmdArgs.join(' '), { timeout: 30000 });
+
+      this.logDebug(`Screenshot stdout: ${stdout}`);
+      if (stderr) this.logDebug(`Screenshot stderr: ${stderr}`);
+
+      if (existsSync(outputPath)) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Screenshot captured successfully!\nPath: ${outputPath}\nProject: ${args.projectPath}`,
+            },
+          ],
+        };
+      } else {
+        return this.createErrorResponse(
+          'Screenshot capture failed - file was not created',
+          ['Check Godot output for errors', 'Ensure project has a main scene set', `stdout: ${stdout}`, `stderr: ${stderr}`]
+        );
+      }
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to capture screenshot: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed correctly', 'Check if the project has a main scene']
+      );
+    }
+  }
+
+  /**
+   * Handle the screenshot_editor tool
+   * Captures a screenshot of the Godot editor window using OS-level tools
+   */
+  private async handleScreenshotEditor(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to save the screenshot']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const screenshotDir = this.ensureScreenshotDir(args.projectPath);
+      const filename = this.generateScreenshotFilename();
+      const outputPath = join(screenshotDir, filename);
+
+      const platform = process.platform;
+      let captureCmd: string;
+
+      if (platform === 'darwin') {
+        // macOS: Use screencapture to capture the frontmost window
+        // -w captures a window (user clicks to select), -x suppresses sound
+        // For automated capture of Godot window specifically:
+        captureCmd = `screencapture -x -w "${outputPath}"`;
+      } else if (platform === 'win32') {
+        // Windows: Use PowerShell to capture the screen
+        const escapedPath = outputPath.replace(/\\/g, '\\\\');
+        captureCmd = `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; $screen = [System.Windows.Forms.Screen]::PrimaryScreen; $bitmap = New-Object System.Drawing.Bitmap($screen.Bounds.Width, $screen.Bounds.Height); $graphics = [System.Drawing.Graphics]::FromImage($bitmap); $graphics.CopyFromScreen($screen.Bounds.Location, [System.Drawing.Point]::Empty, $screen.Bounds.Size); $bitmap.Save('${escapedPath}'); $graphics.Dispose(); $bitmap.Dispose()"`;
+      } else if (platform === 'linux') {
+        // Linux: Try various screenshot tools in order of preference
+        captureCmd = `gnome-screenshot -w -f "${outputPath}" 2>/dev/null || scrot -u "${outputPath}" 2>/dev/null || import -window root "${outputPath}"`;
+      } else {
+        return this.createErrorResponse(
+          `Unsupported platform: ${platform}`,
+          ['Editor screenshots are only supported on macOS, Windows, and Linux']
+        );
+      }
+
+      this.logDebug(`Capturing editor screenshot with command: ${captureCmd}`);
+
+      await execAsync(captureCmd, { timeout: 30000 });
+
+      if (existsSync(outputPath)) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Editor screenshot captured successfully!\nPath: ${outputPath}`,
+            },
+          ],
+        };
+      } else {
+        return this.createErrorResponse(
+          'Screenshot capture failed - file was not created',
+          [
+            'Ensure the Godot editor window is open and visible',
+            'On macOS, you may need to grant screen recording permission in System Settings > Privacy & Security',
+            'On Linux, ensure gnome-screenshot, scrot, or ImageMagick is installed',
+          ]
+        );
+      }
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to capture editor screenshot: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure the Godot editor window is open',
+          'Check if screen capture permissions are granted',
         ]
       );
     }

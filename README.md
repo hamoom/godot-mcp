@@ -76,6 +76,11 @@ This direct feedback loop helps AI assistants like Claude understand what works 
   - Load sprites and textures into Sprite2D nodes
   - Export 3D scenes as MeshLibrary resources for GridMap
   - Save scenes with options for creating variants
+- **Screenshot Capture**:
+  - Capture screenshots of specific scenes (runs scene, captures frame, quits)
+  - Capture screenshots of the main project scene
+  - Capture screenshots of the Godot editor window (OS-level capture)
+  - All screenshots saved to `.godot-mcp/` folder with timestamps
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
@@ -129,7 +134,10 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "export_mesh_library",
         "save_scene",
         "get_uid",
-        "update_project_uids"
+        "update_project_uids",
+        "screenshot_scene",
+        "screenshot_project",
+        "screenshot_editor"
       ]
     }
   }
